@@ -56,6 +56,51 @@ Every release build then signs `pingtrace.exe` automatically; SmartScreen
 stops blocking it and reputation builds from the first download. Until
 then, "Keep" / "Run anyway" on the prompt is safe.
 
+## Folder layout
+
+The release zip extracts to one self-contained folder (flat onedir - the
+runtime files sit next to the exe, there is no installer and nothing
+outside the folder):
+
+```
+pingtrace/
+  run.bat, stop.bat          start / stop (cmd.exe, no admin)
+  pingtrace.exe              the app with its own Python runtime inside
+  static/                    dashboard html/js/css, served as-is
+  targets.json               your target list (editable, see below)
+  github.json                optional GitHub PAT - never committed to git
+  metrics.db (+ -wal, -shm)  history, created on first run
+  .pingtrace.pid             written while running, read by stop.bat
+```
+
+The source tree is the same app as plain Python: `main.py` (entry point),
+`config.py`, `engine.py` (probes), `database.py` (SQLite + tiering),
+`api.py` (FastAPI routes), `github_sync.py` (GitHub Classic client),
+`static/`, `tests/`, `packaging/` (PyInstaller spec + build scripts), and
+the `windows-portable` workflow under `.github/workflows/`.
+
+## Why no administrator privileges (and how to read results)
+
+Windows only lets elevated processes open a raw ICMP socket - that is why
+most ping tools demand "Run as administrator". PingTrace never opens one:
+
+- `tcp`/`udp` targets use a plain `connect()` to the probe port (default
+  443), an unprivileged operation. The latency shown is the time to that
+  handshake, not an ICMP round-trip.
+- `icmp` targets use the same OS call `ping.exe` makes (`IcmpSendEcho`
+  via `iphlpapi.dll` on Windows; an unprivileged DGRAM ICMP socket on
+  Linux) - a real echo, still no elevation.
+- Route traces use UDP probes with increasing TTLs, or the built-in
+  `tracert` on Windows.
+
+What that means when reading the dashboard: a TCP/UDP probe answers
+"can I reach this host **at this port**", not "does it answer ping". A
+host with no open probe port - or a firewall that drops the SYNs - shows
+as **down** even though the host is alive. That is the price of
+unprivileged probing, and the reason `proto: "icmp"` exists: use it for
+hosts where no port is open. Treat "down" as "no answer at the probe
+port", not "the machine is off".
+
 ## Editing targets
 
 `targets.json` next to the exe is the target list. The shipped sample monitors
@@ -98,6 +143,40 @@ saved with the target), never overlap for the same target, and stop when
 the target is disabled or deleted. Each round is stored like a manual trace,
 so `GET /api/targets/{id}/traces` shows the recent history.
 
+## GitHub sync and alert issues (optional)
+
+Give PingTrace a GitHub **Classic** PAT (scope `repo`) and it keeps an
+auditable trail of your monitoring in a repo, and opens an issue when a
+target really is losing packets. Authenticate either way - environment
+variables win over the file:
+
+- `github.json` next to the exe:
+
+  ```json
+  { "token": "ghp_...", "repo": "your-user/pingtrace-state",
+    "branch": "main", "alert_loss_pct": 25, "sync_minutes": 30 }
+  ```
+
+- or the environment: `PINGTRACE_GITHUB_TOKEN` (or plain `GITHUB_TOKEN`),
+  optionally `PINGTRACE_GITHUB_REPO` and `PINGTRACE_GITHUB_BRANCH`.
+
+The token is never written into the repo or into any state snapshot, and
+`github.json` is git-ignored.
+
+Every `sync_minutes` (floor 5) PingTrace commits three files under
+`state/` in that repo: `targets.json` (what you monitor),
+`last-hour.json` (per-target stats for the last hour) and
+`performance-summary.md` (a readable table).
+
+**How the alert issues work.** With each sync, every enabled target is
+checked over the last 30 minutes of 1-minute buckets (at least 10 buckets
+of data required, so a host that was just added cannot alert yet). If the
+worst bucket or the mean loss reaches `alert_loss_pct` (default 25%),
+PingTrace opens an issue titled `[pingtrace] sustained packet loss on
+<host>`, labelled `pingtrace-alert`, with the window stats in the body.
+It never opens a second issue for the same host while one is still open -
+close it when you have looked, and a new incident opens a new issue.
+
 ## Where state lives
 
 Everything stays inside the folder: `metrics.db` (+ WAL sidecars),
@@ -125,10 +204,57 @@ Both run the PyInstaller **onedir** build (`packaging/pingtrace.spec`) and
 assemble `dist/pingtrace/` with the launchers and sample state. onefile is
 deliberately not used - it unpacks to a temp dir and breaks portability.
 
+### Run from source (any OS, for development)
+
+    pip install -r requirements.txt
+    python main.py            # dashboard at http://127.0.0.1:8765/
+
+Useful flags: `--port`, `--probe-port`, `--interval`, `--retention-hours`,
+`--targets host1 host2 ...`. The test suite needs no network (the GitHub
+client is mocked): `pip install pytest && pytest -q`.
+
+
+## Troubleshooting
+
+**"8765 is already in use" / the page never loads.** Another process (or
+another PingTrace) holds the port. Close it, or pick another one: edit
+`set "PORT=..."` in `run.bat`, or start `pingtrace.exe --port 8766`
+directly and open `http://127.0.0.1:8766/`. If `run.bat` says another
+instance is already running, that is by design - it just opens the
+browser at the running one.
+
+**`.pingtrace.pid`.** Written next to the exe while the server runs (in
+`%LOCALAPPDATA%\PingTrace` when the app folder is read-only); `stop.bat`
+reads it to find the process. A stale file left by a crash is harmless -
+the app checks whether the recorded PID is actually alive before treating
+it as a running instance. Delete it by hand only if `stop.bat` claims to
+stop a process you cannot see.
+
+**History and DB retention.** `metrics.db` keeps 7 days by default
+(`--retention-hours` to change it). Recent hours stay at per-probe
+resolution; older data inside the window is rolled up into 1-minute
+buckets automatically, and anything past the window is deleted on a
+timer. Stop the server and delete `metrics.db` (plus the `-wal`/`-shm`
+sidecars) to start history from scratch.
+
 ## Verification status
 
-The Linux onedir build was verified on the build host. The Windows path -
-`build_portable.ps1`, the frozen `pingtrace.exe`, `run.bat` (start + health
-poll + browser open), the dashboard assets, and `stop.bat` - runs as a smoke
-test on a real `windows-latest` runner on every push via the
-`windows-portable` workflow; the release zip is produced by that same job.
+What is verified where, honestly:
+
+- **Linux (the build host):** the app end to end - engine, DB
+  tiering/search/export, API routes, dashboard in a real browser - and
+  the Linux onedir build. `pytest -q`: 93 passed, 1 skipped (the skip is
+  the Windows-only `tracert` engine test).
+- **Windows (CI, real `windows-latest` runner, every push and release):**
+  `build_portable.ps1`, the frozen `pingtrace.exe`, the full test suite,
+  the dashboard assets, the `run.bat` already-running path, and
+  `stop.bat`. The release zip is produced by that same job, so what you
+  download is what was smoke-tested.
+- **Windows, not covered headless:** `run.bat`'s cold start via
+  `start /min` needs a desktop session (a minimized console dies with
+  its parent cmd on CI runners). It works on real desktops - the
+  user-reported failure that led to the release zip was the missing exe,
+  not `run.bat` - and CI exercises the same exe, health poll and stop
+  path directly.
+- **Never automated:** SmartScreen/Defender behaviour on a fresh
+  download (see above) and interactive browser UI checks on Windows.
